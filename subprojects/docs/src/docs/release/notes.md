@@ -26,16 +26,6 @@ Switch your build to use Gradle @version@ by updating your wrapper:
 
 `./gradlew wrapper --gradle-version=@version@`
 
-## Improvements for plugin authors
-
-### Task dependencies are honored for `@Input` properties of type `Property`
-
-TBD - honors dependencies on `@Input` properties.
-
-### Property methods
-
-TBD - added `getLocationOnly()`. 
-
 ## Promoted features
 Promoted features are features that were incubating in previous versions of Gradle but are now supported and subject to backwards compatibility.
 See the User Manual section on the “[Feature Lifecycle](userguide/feature_lifecycle.html)” for more information.
@@ -59,9 +49,9 @@ in the next major Gradle version (Gradle 6.0). See the User Manual section on th
 
 The following are the newly deprecated items in this Gradle release. If you have concerns about a deprecation, please raise it via the [Gradle Forums](https://discuss.gradle.org).
 
-### Deprecated build comparison plugin
-
-The [build comparison](userguide/comparing_builds.html) plugin has been deprecated.
+<!--
+### Example deprecation
+-->
 
 ### Breaking changes
 
