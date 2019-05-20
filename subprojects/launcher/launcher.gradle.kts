@@ -8,20 +8,24 @@ plugins {
 }
 
 dependencies {
-    compile(project(":baseServices"))
-    compile(project(":jvmServices"))
-    compile(project(":core"))
-    compile(project(":cli"))
-    compile(project(":buildOption"))
-    compile(project(":toolingApi"))
-    compile(project(":native"))
-    compile(project(":logging"))
-    compile(project(":docs"))
 
-    compile(library("asm"))
-    compile(library("commons_io"))
-    compile(library("commons_lang"))
-    compile(library("slf4j_api"))
+    compileOnly(project(":launcherBootstrap"))
+    compileOnly(project(":launcherStartup"))
+
+    runtimeOnly(project(":baseServices"))
+    runtimeOnly(project(":jvmServices"))
+    runtimeOnly(project(":core"))
+    runtimeOnly(project(":cli"))
+    runtimeOnly(project(":buildOption"))
+    runtimeOnly(project(":toolingApi"))
+    runtimeOnly(project(":native"))
+    runtimeOnly(project(":logging"))
+    runtimeOnly(project(":docs"))
+
+    runtimeOnly(library("asm"))
+    runtimeOnly(library("commons_io"))
+    runtimeOnly(library("commons_lang"))
+    runtimeOnly(library("slf4j_api"))
 
     integTestCompile(project(":internalIntegTesting"))
     integTestRuntime(project(":plugins"))
@@ -49,7 +53,7 @@ if (currentJavaInstallation.javaVersion.isJava8) {
 }
 
 gradlebuildJava {
-    moduleType = ModuleType.ENTRY_POINT
+    moduleType = ModuleType.STARTUP
 }
 
 testFixtures {
@@ -68,9 +72,13 @@ integTestTasks.configureEach {
 val configureJar by tasks.registering {
     doLast {
         val classpath = listOf(":baseServices", ":coreApi", ":core").joinToString(" ") {
-            project(it).tasks.jar.get().archivePath.name
+            project(it).tasks.jar.get().archiveFile.get().asFile.name
         }
-        tasks.jar.get().manifest.attributes("Class-Path" to classpath)
+        tasks.jar {
+            from(project(":launcherBootstrap").sourceSets["main"].output.files)
+            from(project(":launcherStartup").sourceSets["main"].output.files)
+            manifest.attributes("Class-Path" to classpath)
+        }
     }
 }
 
@@ -81,7 +89,7 @@ tasks.jar {
 
 val startScripts = tasks.register<GradleStartScriptGenerator>("startScripts") {
     startScriptsDir = file("$buildDir/startScripts")
-    launcherJar = tasks.jar.get().outputs.files
+    launcherBootstrapClasspathFiles.from(tasks.jar.get().outputs.files)
 }
 
 configurations {

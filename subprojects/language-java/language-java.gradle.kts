@@ -7,6 +7,9 @@ plugins {
 }
 
 dependencies {
+
+    compileOnly(project(":launcherStartup"))
+
     implementation(library("asm"))
     implementation(library("asm_commons"))
     implementation(library("groovy"))
@@ -15,16 +18,16 @@ dependencies {
     compile(project(":platformJvm"))
     compile(project(":languageJvm"))
     compile(project(":toolingApi"))
-    compile(project(":launcher"))
     implementation(project(":snapshots"))
+
+    runtimeOnly(project(":launcher"))
 
     // TODO - get rid of this cycle
     integTestRuntime(project(":plugins"))
 }
 
 gradlebuildJava {
-    // Needs to run in the compiler daemon
-    moduleType = ModuleType.ENTRY_POINT
+    moduleType = ModuleType.CORE
 }
 
 testFixtures {

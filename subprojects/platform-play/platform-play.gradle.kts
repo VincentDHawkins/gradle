@@ -22,7 +22,7 @@ dependencies {
 
 gradlebuildJava {
     // Code needs to run in the compiler daemon
-    moduleType = ModuleType.WORKER
+    moduleType = ModuleType.CORE
 }
 
 testFixtures {

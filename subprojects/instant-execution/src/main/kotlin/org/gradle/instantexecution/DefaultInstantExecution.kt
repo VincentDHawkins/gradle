@@ -20,15 +20,11 @@ import groovy.lang.GroovyObject
 import org.gradle.api.DefaultTask
 import org.gradle.api.GradleException
 import org.gradle.api.Task
-import org.gradle.api.file.DirectoryProperty
-import org.gradle.api.file.RegularFileProperty
 import org.gradle.api.internal.AbstractTask
 import org.gradle.api.internal.ConventionTask
 import org.gradle.api.internal.GeneratedSubclasses
-import org.gradle.api.internal.IConventionAware
 import org.gradle.api.internal.TaskInternal
 import org.gradle.api.logging.Logging
-import org.gradle.api.provider.Property
 import org.gradle.initialization.InstantExecution
 import org.gradle.internal.classloader.ClasspathUtil
 import org.gradle.internal.classpath.ClassPath
@@ -41,12 +37,12 @@ import org.gradle.internal.serialize.kryo.KryoBackedDecoder
 import org.gradle.internal.serialize.kryo.KryoBackedEncoder
 import org.gradle.util.GradleVersion
 import org.gradle.util.Path
+
 import java.io.File
 import java.lang.reflect.Field
 import java.lang.reflect.Modifier
 import java.nio.file.Files
 import java.util.SortedSet
-import java.util.function.Supplier
 
 
 class DefaultInstantExecution(
@@ -101,6 +97,7 @@ class DefaultInstantExecution(
         KryoBackedDecoder(instantExecutionStateFile.inputStream()).use { decoder ->
             val rootProjectName = decoder.readString()
             val build = host.createBuild(rootProjectName)
+            loadRelevantProjects(decoder, build)
             build.autoApplyPlugins()
             build.scheduleTasks(loadTasksFor(decoder, build))
         }
@@ -112,17 +109,21 @@ class DefaultInstantExecution(
         KryoBackedEncoder(instantExecutionStateFile.outputStream()).use { encoder ->
             encoder.writeString(build.rootProject.name)
             val scheduledTasks = build.scheduledTasks
+            saveRelevantProjectsFor(scheduledTasks, encoder)
             val relevantClassPath = classPathFor(scheduledTasks)
             encoder.serializeClassPath(relevantClassPath)
-            saveRelevantProjectsFor(scheduledTasks, encoder)
             encoder.serializeCollection(scheduledTasks) { task ->
-                encoder.saveStateOf(task, build)
+                try {
+                    encoder.saveStateOf(task, build)
+                } catch (e: Exception) {
+                    throw GradleException("Could not save state of $task.", e)
+                }
             }
         }
     }
 
     private
-    fun saveRelevantProjectsFor(tasks: List<Task>, encoder: KryoBackedEncoder) {
+    fun saveRelevantProjectsFor(tasks: List<Task>, encoder: Encoder) {
         encoder.serializeCollection(fillTheGapsOf(relevantProjectsFor(tasks))) {
             encoder.writeString(it.path)
         }
@@ -133,6 +134,13 @@ class DefaultInstantExecution(
         tasks.mapNotNull { task ->
             task.project.takeIf { it.parent != null }?.path?.let(Path::path)
         }.toSortedSet()
+
+    private
+    fun loadRelevantProjects(decoder: Decoder, build: InstantExecutionBuild) {
+        decoder.deserializeCollection {
+            build.createProject(decoder.readString())
+        }
+    }
 
     private
     fun loadTasksFor(decoder: Decoder, build: InstantExecutionBuild): List<Task> {
@@ -155,9 +163,6 @@ class DefaultInstantExecution(
     fun loadTasksWithDependenciesFor(decoder: Decoder, build: InstantExecutionBuild): List<Pair<Task, List<String>>> {
         val classPath = decoder.deserializeClassPath()
         val taskClassLoader = classLoaderFor(classPath)
-        decoder.deserializeCollection {
-            build.createProject(decoder.readString())
-        }
 
         build.registerProjects()
 
@@ -180,7 +185,7 @@ class DefaultInstantExecution(
         task.javaClass.classLoader.let(ClasspathUtil::getClasspath)
 
     private
-    fun KryoBackedEncoder.saveStateOf(task: Task, build: ClassicModeBuild) {
+    fun Encoder.saveStateOf(task: Task, build: ClassicModeBuild) {
         val taskType = GeneratedSubclasses.unpack(task.javaClass)
         writeString(task.project.path)
         writeString(task.name)
@@ -189,44 +194,7 @@ class DefaultInstantExecution(
             writeString(it.path)
         }
 
-        for (field in relevantStateOf(taskType)) {
-            val fieldValue = field.getFieldValue(task)
-            val conventionalValue = fieldValue ?: conventionalValueOf(task, field.name)
-            val finalValue = unpack(conventionalValue) ?: continue
-            val valueSerializer = stateSerializer.serializerFor(finalValue)
-            if (valueSerializer == null) {
-                logField(taskType, field.name, "serialize", "there's no serializer for type ${finalValue.javaClass}")
-                continue
-            }
-            writeString(field.name)
-            try {
-                valueSerializer(this)
-            } catch (e: Exception) {
-                throw GradleException("Could not save the value of field `${field.name}` of task `${task.path}`.", e)
-            }
-            println("SERIALIZED ${task.path} field ${field.name} value $finalValue")
-        }
-        writeString("")
-    }
-
-    private
-    fun conventionalValueOf(task: Task, fieldName: String): Any? =
-        (task as IConventionAware).conventionMapping.getConventionValue(null, fieldName, false)
-
-    private
-    fun unpack(fieldValue: Any?) = when (fieldValue) {
-        is DirectoryProperty -> fieldValue.asFile.orNull
-        is RegularFileProperty -> fieldValue.asFile.orNull
-        is Property<*> -> fieldValue.orNull
-        is Supplier<*> -> fieldValue.get()
-        is Function0<*> -> (fieldValue as (() -> Any?)).invoke()
-        else -> fieldValue
-    }
-
-    private
-    fun Field.getFieldValue(task: Task): Any? {
-        isAccessible = true
-        return get(task)
+        BeanFieldSerializer(task, taskType, stateSerializer).invoke(this, SerializationListener(task, logger))
     }
 
     private
@@ -235,87 +203,17 @@ class DefaultInstantExecution(
         val taskName = decoder.readString()
         val typeName = decoder.readString()
         val taskClass = taskClassLoader.loadClass(typeName).asSubclass(Task::class.java)
-        val taskFieldsByName = relevantStateOf(taskClass).associateBy { it.name }
         val task = build.createTask(projectPath, taskName, taskClass)
         val taskDependencies = decoder.deserializeStrings()
         val deserializer = host.deserializerFor(taskClassLoader)
-        while (true) {
-            val fieldName = decoder.readString()
-            if (fieldName.isEmpty()) {
-                break
-            }
-            try {
-                val value = deserializer.read(decoder) ?: continue
-                val field = taskFieldsByName.getValue(fieldName)
-                println("DESERIALIZED ${task.path} field $fieldName value $value")
-                @Suppress("unchecked_cast")
-                when (field.type) {
-                    DirectoryProperty::class.java -> (field.getFieldValue(task) as? DirectoryProperty)?.set(value as File)
-                    RegularFileProperty::class.java -> (field.getFieldValue(task) as? RegularFileProperty)?.set(value as File)
-                    Property::class.java -> (field.getFieldValue(task) as? Property<Any>)?.set(value)
-                    Supplier::class.java -> field.setValue(task, Supplier { value })
-                    Function0::class.java -> field.setValue(task, { value })
-                    else -> {
-                        if (field.type.isAssignableFrom(value.javaClass)) {
-                            field.setValue(task, value)
-                        } else {
-                            logField(taskClass, fieldName, "deserialize", "${field.type} != ${value.javaClass}")
-                        }
-                    }
-                }
-            } catch (e: Exception) {
-                throw GradleException("Could not load value of field `$fieldName` of task ${task.path}.", e)
-            }
-        }
+        val listener = SerializationListener(task, logger)
+        BeanFieldDeserializer(task, taskClass, deserializer).deserialize(decoder, listener)
         return task to taskDependencies
     }
 
     private
     fun InstantExecutionBuild.createTask(projectPath: String, taskName: String, taskClass: Class<out Task>) =
         getProject(projectPath).tasks.create(taskName, taskClass)
-
-    private
-    fun Field.setValue(task: Task, value: Any) {
-        isAccessible = true
-        set(task, value)
-    }
-
-    private
-    fun relevantStateOf(taskType: Class<*>): Sequence<Field> =
-        relevantTypeHierarchyOf(taskType).flatMap { type ->
-            type.declaredFields.asSequence().filterNot { field ->
-                Modifier.isStatic(field.modifiers) || Modifier.isTransient(field.modifiers)
-            }
-        }
-
-    private
-    fun relevantTypeHierarchyOf(taskType: Class<*>): Sequence<Class<*>> = sequence {
-        var current = taskType
-        while (isRelevantDeclaringClass(current)) {
-            yield(current)
-            current = current.superclass
-        }
-    }
-
-    private
-    fun isRelevantDeclaringClass(declaringClass: Class<*>): Boolean =
-        declaringClass !in irrelevantDeclaringClasses
-
-    private
-    val irrelevantDeclaringClasses = setOf(
-        Object::class.java,
-        GroovyObject::class.java,
-        Task::class.java,
-        TaskInternal::class.java,
-        DefaultTask::class.java,
-        AbstractTask::class.java,
-        ConventionTask::class.java
-    )
-
-    private
-    fun logField(taskType: Class<*>, name: String?, actionName: String, reason: String) {
-        logger.lifecycle("Field `$name` from $taskType cannot be ${actionName}d because $reason.")
-    }
 
     private
     val isInstantExecutionEnabled: Boolean
@@ -329,6 +227,42 @@ class DefaultInstantExecution(
         File(dir, cacheFileName)
     }
 }
+
+
+internal
+fun relevantStateOf(taskType: Class<*>): Sequence<Field> =
+    relevantTypeHierarchyOf(taskType).flatMap { type ->
+        type.declaredFields.asSequence().filterNot { field ->
+            Modifier.isStatic(field.modifiers) || Modifier.isTransient(field.modifiers)
+        }
+    }
+
+
+private
+fun relevantTypeHierarchyOf(taskType: Class<*>): Sequence<Class<*>> = sequence {
+    var current = taskType
+    while (isRelevantDeclaringClass(current)) {
+        yield(current)
+        current = current.superclass
+    }
+}
+
+
+private
+fun isRelevantDeclaringClass(declaringClass: Class<*>): Boolean =
+    declaringClass !in irrelevantDeclaringClasses
+
+
+private
+val irrelevantDeclaringClasses = setOf(
+    Object::class.java,
+    GroovyObject::class.java,
+    Task::class.java,
+    TaskInternal::class.java,
+    DefaultTask::class.java,
+    AbstractTask::class.java,
+    ConventionTask::class.java
+)
 
 
 internal

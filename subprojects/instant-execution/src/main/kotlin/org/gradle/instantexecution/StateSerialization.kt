@@ -16,8 +16,12 @@
 
 package org.gradle.instantexecution
 
+import groovy.lang.GroovyObjectSupport
+import org.gradle.api.Project
+import org.gradle.api.Task
 import org.gradle.api.artifacts.ArtifactCollection
 import org.gradle.api.file.FileCollection
+import org.gradle.api.initialization.Settings
 import org.gradle.api.internal.file.DefaultCompositeFileTree
 import org.gradle.api.internal.file.FileCollectionFactory
 import org.gradle.api.internal.file.FileCollectionInternal
@@ -30,21 +34,21 @@ import org.gradle.api.internal.file.collections.ImmutableFileCollection
 import org.gradle.api.internal.file.copy.CopySpecInternal
 import org.gradle.api.internal.file.copy.DefaultCopySpec
 import org.gradle.api.internal.file.copy.DestinationRootCopySpec
+import org.gradle.api.invocation.Gradle
 import org.gradle.api.tasks.util.PatternSet
 import org.gradle.internal.reflect.Instantiator
 import org.gradle.internal.serialize.BaseSerializerFactory
 import org.gradle.internal.serialize.Decoder
 import org.gradle.internal.serialize.Encoder
-import org.gradle.internal.serialize.ListSerializer
 import org.gradle.internal.serialize.Serializer
 import org.gradle.internal.serialize.SetSerializer
-
+import org.slf4j.LoggerFactory
+import sun.reflect.ReflectionFactory
 import java.io.File
-
 import java.lang.reflect.Modifier
-
 import java.util.ArrayList
 import java.util.LinkedHashSet
+import kotlin.reflect.KClass
 
 
 class StateSerialization(
@@ -70,126 +74,144 @@ class StateSerialization(
         DefaultStateDeserializer(beanClassLoader)
 
     private
-    inner class DefaultStateSerializer : StateSerializer, Serializer<Any> {
-
-        private
-        val listSerializer = ListSerializer(this)
-
-        override fun write(encoder: Encoder, value: Any?) {
-            val serializer = serializerFor(value)
-            require(serializer != null) {
-                "No serializer for $value found."
-            }
-            serializer(encoder)
-        }
+    inner class DefaultStateSerializer : StateSerializer {
 
         override fun serializerFor(value: Any?): ValueSerializer? = when (value) {
-            null -> { encoder ->
+            null -> { encoder, _ ->
                 encoder.writeByte(NULL_VALUE)
             }
-            is String -> { encoder ->
+            is String -> { encoder, _ ->
                 encoder.writeWithTag(STRING_TYPE, stringSerializer, value)
             }
-            is FileTreeInternal -> { encoder ->
+            is FileTreeInternal -> { encoder, _ ->
                 encoder.writeWithTag(FILE_TREE_TYPE, fileTreeSerializer, value)
             }
-            is File -> { encoder ->
+            is File -> { encoder, _ ->
                 encoder.writeWithTag(FILE_TYPE, BaseSerializerFactory.FILE_SERIALIZER, value)
             }
-            is FileCollection -> { encoder ->
+            is FileCollection -> { encoder, _ ->
                 encoder.writeWithTag(FILE_COLLECTION_TYPE, fileSetSerializer, value.files)
             }
-            is List<*> -> { encoder ->
-                encoder.writeWithTag(LIST_TYPE, listSerializer, value)
-            }
-            is ArtifactCollection -> { encoder ->
+            is List<*> -> listSerializerFor(value)
+            is ArtifactCollection -> { encoder, _ ->
                 encoder.writeByte(ARTIFACT_COLLECTION_TYPE)
             }
             is DefaultCopySpec -> defaultCopySpecSerializerFor(value)
             is DestinationRootCopySpec -> destinationRootCopySpecSerializerFor(value)
+            is Project -> projectStateType(Project::class)
+            is Gradle -> projectStateType(Gradle::class)
+            is Settings -> projectStateType(Settings::class)
+            is Task -> projectStateType(Task::class)
             else -> if (isBean(value.javaClass)) beanSerializerFor(value) else null
         }
 
         private
-        fun defaultCopySpecSerializerFor(value: DefaultCopySpec): (Encoder) -> Unit = { encoder ->
+        fun projectStateType(type: KClass<*>): ValueSerializer? {
+            LoggerFactory.getLogger(StateSerialization::class.java).warn("instant-execution > Cannot serialize object of type ${type.java.name} as these are not supported with instant execution.")
+            return null
+        }
+
+        private
+        fun defaultCopySpecSerializerFor(value: DefaultCopySpec): ValueSerializer = { encoder, listener ->
             val allSourcePaths = ArrayList<File>()
             collectSourcePathsFrom(value, allSourcePaths)
             encoder.writeByte(DEFAULT_COPY_SPEC)
-            write(encoder, allSourcePaths)
+            write(encoder, listener, allSourcePaths)
         }
 
         private
-        fun destinationRootCopySpecSerializerFor(value: DestinationRootCopySpec): (Encoder) -> Unit = { encoder ->
+        fun destinationRootCopySpecSerializerFor(value: DestinationRootCopySpec): ValueSerializer = { encoder, listener ->
             encoder.writeByte(DESTINATION_ROOT_COPY_SPEC)
-            write(encoder, value.destinationDir)
-            write(encoder, value.delegate)
+            write(encoder, listener, value.destinationDir)
+            write(encoder, listener, value.delegate)
         }
 
         private
-        fun beanSerializerFor(value: Any): ValueSerializer = { encoder ->
+        fun beanSerializerFor(value: Any): ValueSerializer = { encoder, listener ->
             encoder.writeByte(BEAN)
             encoder.writeString(value.javaClass.name)
+            BeanFieldSerializer(value, value.javaClass, this).invoke(encoder, listener)
+        }
+
+        private
+        fun listSerializerFor(value: List<*>): ValueSerializer = { encoder, listener ->
+            encoder.writeByte(LIST_TYPE)
+            encoder.writeSmallInt(value.size)
+            for (item in value) {
+                write(encoder, listener, item)
+            }
+        }
+
+        private
+        fun write(encoder: Encoder, listener: SerializationListener, value: Any?) {
+            serializerFor(value)!!.invoke(encoder, listener)
         }
 
         private
         fun isBean(type: Class<*>) =
             !Modifier.isAbstract(type.modifiers) && type.declaredConstructors.any { it.parameterCount == 0 }
-
-        override fun read(decoder: Decoder): Any? = throw UnsupportedOperationException()
     }
 
     private
     inner class DefaultStateDeserializer(
         private val beanClassLoader: ClassLoader
-    ) : StateDeserializer, Serializer<Any> {
+    ) : StateDeserializer {
 
-        private
-        val listSerializer by lazy(LazyThreadSafetyMode.NONE) {
-            ListSerializer(this)
-        }
-
-        override fun read(decoder: Decoder): Any? = when (decoder.readByte()) {
+        override fun read(decoder: Decoder, listener: SerializationListener): Any? = when (decoder.readByte()) {
             NULL_VALUE -> null
             STRING_TYPE -> stringSerializer.read(decoder)
             FILE_TREE_TYPE -> fileTreeSerializer.read(decoder)
             FILE_TYPE -> BaseSerializerFactory.FILE_SERIALIZER.read(decoder)
             FILE_COLLECTION_TYPE -> fileCollectionFactory.fixed(fileSetSerializer.read(decoder))
-            LIST_TYPE -> listSerializer.read(decoder)
+            LIST_TYPE -> deserializeList(decoder, listener)
             ARTIFACT_COLLECTION_TYPE -> EmptyArtifactCollection(ImmutableFileCollection.of())
-            DEFAULT_COPY_SPEC -> deserializeDefaultCopySpec(decoder, this)
-            DESTINATION_ROOT_COPY_SPEC -> deserializeDestinationRootCopySpec(decoder, this)
-            BEAN -> deserializeBean(decoder, beanClassLoader)
+            DEFAULT_COPY_SPEC -> deserializeDefaultCopySpec(decoder, listener)
+            DESTINATION_ROOT_COPY_SPEC -> deserializeDestinationRootCopySpec(decoder, listener)
+            BEAN -> deserializeBean(decoder, listener, beanClassLoader)
             else -> throw UnsupportedOperationException()
         }
 
         private
-        fun deserializeBean(decoder: Decoder, loader: ClassLoader): Any {
+        fun deserializeBean(decoder: Decoder, listener: SerializationListener, loader: ClassLoader): Any {
             val beanTypeName = decoder.readString()
-            return loader.loadClass(beanTypeName).declaredConstructors.first { it.parameterCount == 0 }.run {
-                isAccessible = true
-                newInstance()
+            val beanType = loader.loadClass(beanTypeName)
+            val constructor = if (GroovyObjectSupport::class.java.isAssignableFrom(beanType)) {
+                ReflectionFactory.getReflectionFactory().newConstructorForSerialization(beanType, GroovyObjectSupport::class.java.getConstructor())
+            } else {
+                ReflectionFactory.getReflectionFactory().newConstructorForSerialization(beanType, Object::class.java.getConstructor())
             }
+            val bean = constructor.newInstance()
+            BeanFieldDeserializer(bean, bean.javaClass, this).deserialize(decoder, listener)
+            return bean
         }
 
         private
-        fun deserializeDestinationRootCopySpec(decoder: Decoder, read: StateDeserializer): DestinationRootCopySpec {
-            val destDir = read.read(decoder) as? File
-            val delegate = read.read(decoder) as CopySpecInternal
+        fun deserializeList(decoder: Decoder, listener: SerializationListener): List<Any?> {
+            val size = decoder.readSmallInt()
+            val items = ArrayList<Any?>(size)
+            for (i in 1..size) {
+                items.add(read(decoder, listener))
+            }
+            return items
+        }
+
+        private
+        fun deserializeDestinationRootCopySpec(decoder: Decoder, listener: SerializationListener): DestinationRootCopySpec {
+            val destDir = read(decoder, listener) as? File
+            val delegate = read(decoder, listener) as CopySpecInternal
             val spec = DestinationRootCopySpec(fileResolver, delegate)
             destDir?.let(spec::into)
             return spec
         }
 
         private
-        fun deserializeDefaultCopySpec(decoder: Decoder, read: StateDeserializer): DefaultCopySpec {
+        fun deserializeDefaultCopySpec(decoder: Decoder, listener: SerializationListener): DefaultCopySpec {
             @Suppress("unchecked_cast")
-            val sourceFiles = read.read(decoder) as List<File>
+            val sourceFiles = read(decoder, listener) as List<File>
             val copySpec = DefaultCopySpec(fileResolver, instantiator)
             copySpec.from(sourceFiles)
             return copySpec
         }
-
-        override fun write(encoder: Encoder, value: Any?) = throw UnsupportedOperationException()
     }
 
     private
